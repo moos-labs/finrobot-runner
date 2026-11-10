@@ -1,0 +1,31 @@
+name: Run analysis
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          git clone --depth 1 https://github.com/AI4Finance-Foundation/FinRobot.git finrobot_src
+          pip install -e ./finrobot_src
+
+      - name: Run commands
+        run: ${{ vars.COMMANDS }}
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results
+          path: results/
