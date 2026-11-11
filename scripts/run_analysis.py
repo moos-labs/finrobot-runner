@@ -38,8 +38,43 @@ def main() -> int:
         "temperature": 0.2,
         "timeout": 300,
     }
+    from typing import Annotated
+
     from finrobot.data_source.yfinance_utils import YFinanceUtils
     from finrobot.agents.workflow import SingleAssistant
+
+    # Cohere's tool-schema validator rejects any parameter whose JSON
+    # schema lacks a "type" (the TradingAgents lesson). YFinanceUtils'
+    # own signatures use a custom SavePathType / Optional[str] for
+    # save_path, which AG2 renders typeless -- so the agent gets these
+    # plainly-typed wrappers instead (no save_path parameters at all).
+    def get_stock_data(
+        symbol: Annotated[str, "ticker symbol"],
+        start_date: Annotated[str, "start date, YYYY-mm-dd"],
+        end_date: Annotated[str, "end date, YYYY-mm-dd"],
+    ) -> str:
+        """retrieve stock price data for designated ticker symbol"""
+        df = YFinanceUtils.get_stock_data(symbol, start_date, end_date)
+        return df.tail(120).to_string()
+
+    def get_stock_info(
+        symbol: Annotated[str, "ticker symbol"],
+    ) -> str:
+        """fetches and returns latest stock information"""
+        return json.dumps(YFinanceUtils.get_stock_info(symbol), default=str)
+
+    def get_company_info(
+        symbol: Annotated[str, "ticker symbol"],
+    ) -> str:
+        """fetches and returns company information"""
+        df = YFinanceUtils.get_company_info(symbol)
+        return df.to_string()
+
+    def get_analyst_recommendations(
+        symbol: Annotated[str, "ticker symbol"],
+    ) -> str:
+        """fetches the latest analyst recommendations"""
+        return str(YFinanceUtils.get_analyst_recommendations(symbol))
 
     profile = (
         "As a Market Analyst, one must possess strong analytical and "
@@ -52,10 +87,10 @@ def main() -> int:
         "name": "Market_Analyst",
         "profile": profile,
         "toolkits": [
-            YFinanceUtils.get_stock_data,
-            YFinanceUtils.get_stock_info,
-            YFinanceUtils.get_company_info,
-            YFinanceUtils.get_analyst_recommendations,
+            get_stock_data,
+            get_stock_info,
+            get_company_info,
+            get_analyst_recommendations,
         ],
     }
     agent = SingleAssistant(config, llm_config=llm_config)
