@@ -22,6 +22,8 @@ jobs:
 
       - name: Run commands
         run: ${{ vars.COMMANDS }}
+        env:
+          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
 
       - name: Upload results
         if: always()
