@@ -19,6 +19,7 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/AI4Finance-Foundation/FinRobot.git finrobot_src
           pip install -e ./finrobot_src
+          pip install openai
 
       - name: Run commands
         run: ${{ vars.COMMANDS }}
