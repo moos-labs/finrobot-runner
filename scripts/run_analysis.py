@@ -94,9 +94,18 @@ def main() -> int:
         ],
     }
     agent = SingleAssistant(config, llm_config=llm_config)
+    # SingleAssistant.chat() resets both agents at the end, which wipes
+    # chat_messages before we can harvest the transcript -- disable the
+    # reset for this one-shot run.
+    agent.reset = lambda: None
+    from datetime import date, timedelta
+    today = date.today()
+    start = today - timedelta(days=100)
     prompt = (
-        f"Analyze the stock {ticker}. First use your tools to fetch its "
-        f"recent daily price data, company info and analyst recommendations. "
+        f"Today is {today.isoformat()}. Analyze the stock {ticker}. "
+        f"First use your tools to fetch its daily price data for the most "
+        f"recent period ({start.isoformat()} to {today.isoformat()}), its "
+        f"company info and its analyst recommendations. "
         f"Then write a concise analysis: trend, momentum, key levels, risks, "
         f"and end with a line exactly like "
         f"'VERDICT: bullish - one sentence reason' (or bearish / neutral). "
@@ -105,13 +114,24 @@ def main() -> int:
     agent.chat(prompt)
 
     msgs = []
+    seen = set()
     try:
-        hist = agent.user_proxy.chat_messages.get(agent.assistant, [])
-        for m in hist:
-            c = (m.get("content") or "").strip()
-            if c:
-                msgs.append({"name": m.get("name"), "role": m.get("role"),
-                             "content": c})
+        stores = []
+        try:
+            stores.append(agent.user_proxy.chat_messages.get(agent.assistant, []))
+        except Exception:
+            pass
+        try:
+            stores.append(agent.assistant.chat_messages.get(agent.user_proxy, []))
+        except Exception:
+            pass
+        for hist in stores:
+            for m in hist:
+                c = (m.get("content") or "").strip()
+                if c and c not in seen:
+                    seen.add(c)
+                    msgs.append({"name": m.get("name"), "role": m.get("role"),
+                                 "content": c})
     except Exception:
         pass
     analysis = ""
