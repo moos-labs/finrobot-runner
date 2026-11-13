@@ -20,7 +20,7 @@ Point-in-time discipline: items dated after the analysis date are
 dropped. Everything fetched is cached per process and can be saved to
 results/ so the sweep archive preserves exactly what the agent saw.
 """
-import json, os, re, urllib.parse
+import json, os, re, time, urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
@@ -228,6 +228,107 @@ def fetch_edgar_facts(ticker, as_of):
         return None
 
 
+def fetch_ohlc(ticker, as_of):
+    """Daily OHLC history from Yahoo's chart API directly — the fleet's
+    standard price route (period-based requests: range=max silently
+    degrades to monthly bars). yfinance cannot read .CA tickers at all
+    (Egypt DST bug) and its long POUL history mixes the pre-merger
+    price scale into the series.
+
+    The returned series is CONTINUOUS — corporate-action resets are
+    back-adjusted the way data vendors adjust for splits:
+    - Yahoo split events (when the API reports them) are applied.
+    - On price-limit markets (.CA: EGX moves are capped at ±20%), any
+      residual overnight close jump beyond ±25% cannot be a trade — it
+      is an exchange reference-price reset (e.g. POUL's Sep-2026
+      merger, 38.20 -> 9.71). Earlier rows are scaled by the break
+      ratio so returns and moving averages stay meaningful; volumes
+      are scaled by the inverse.
+    Returns a list of row dicts or None."""
+    try:
+        end = datetime.strptime(as_of, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except Exception:
+        end = datetime.now(timezone.utc)
+    p2 = int(end.timestamp()) + 2 * 86400
+    p1 = int(end.timestamp()) - 5 * 365 * 86400
+    url = ("https://query1.finance.yahoo.com/v8/finance/chart/"
+           + urllib.parse.quote(ticker))
+    data = None
+    for attempt in (1, 2):
+        try:
+            r = requests.get(url, params={"period1": p1, "period2": p2,
+                                          "interval": "1d",
+                                          "events": "split"},
+                             headers=UA, timeout=30)
+            r.raise_for_status()
+            res = (r.json().get("chart") or {}).get("result") or []
+            if res:
+                data = res[0]
+                break
+        except Exception:
+            if attempt == 2:
+                return None
+            time.sleep(3)
+    if data is None:
+        return None
+    off = int(((data.get("meta") or {}).get("gmtoffset") or 0))
+    quote = ((data.get("indicators") or {}).get("quote") or [{}])[0]
+
+    def g(key, i):
+        arr = quote.get(key) or []
+        return arr[i] if i < len(arr) else None
+
+    rows = []
+    for i, t in enumerate(data.get("timestamp") or []):
+        close = g("close", i)
+        if close is None:
+            continue
+        rows.append({
+            "date": datetime.fromtimestamp(t + off, timezone.utc)
+                    .strftime("%Y-%m-%d"),
+            "open": g("open", i), "high": g("high", i),
+            "low": g("low", i), "close": close,
+            "volume": g("volume", i),
+            "_f": 1.0,
+        })
+    if not rows:
+        return None
+    # Yahoo split events: "2:1" on date D -> pre-D prices x 1/2.
+    splits = ((data.get("events") or {}).get("splits") or {})
+    for ev in splits.values():
+        try:
+            num, den = (float(x) for x in str(ev.get("splitRatio", ""))
+                        .split(":"))
+            d0 = datetime.fromtimestamp(int(ev.get("date", 0)) + off,
+                                        timezone.utc).strftime("%Y-%m-%d")
+            for row in rows:
+                if row["date"] < d0:
+                    row["_f"] *= den / num if num else 1.0
+        except Exception:
+            continue
+    # Reference-price resets on price-limit markets (see docstring):
+    # scan backwards, carrying the cumulative adjustment factor.
+    if ticker.upper().endswith(".CA"):
+        f = 1.0
+        for i in range(len(rows) - 1, 0, -1):
+            rows[i]["_f"] *= f
+            prev, cur = rows[i - 1]["close"], rows[i]["close"]
+            if prev:
+                ratio = cur / prev
+                if ratio > 1.25 or ratio < 0.75:
+                    f *= ratio
+        rows[0]["_f"] *= f
+    for row in rows:
+        f = row.pop("_f")
+        for k in ("open", "high", "low", "close"):
+            if row[k] is not None:
+                row[k] = row[k] * f
+        row["adj"] = row["close"]
+        if row["volume"]:
+            row["volume"] = row["volume"] / f if f else row["volume"]
+    return rows
+
+
 class FleetContext:
     """Fetch-once cache of everything the fleet knows about a ticker."""
 
@@ -238,6 +339,67 @@ class FleetContext:
         self._items = None
         self._fundamentals = None
         self._fundamentals_done = False
+        self._ohlc_rows = None
+
+    def ohlc_csv(self, start_date, end_date):
+        """OHLCV in the exact CSV shape yfinance's vendor returns, so
+        TradingAgents' market analyst reads the fleet's price series."""
+        if self._ohlc_rows is None:
+            self._ohlc_rows = fetch_ohlc(self.ticker, self.as_of) or []
+        if not self._ohlc_rows:
+            return None
+
+        def n(v):
+            if v is None:
+                return ""
+            return str(int(v)) if float(v) == int(v) and abs(v) >= 1000 \
+                else f"{v:.4f}".rstrip("0").rstrip(".")
+
+        lines = ["Date,Open,High,Low,Close,Adj Close,Volume"]
+        for r in self._ohlc_rows:
+            if start_date <= r["date"] <= end_date:
+                lines.append(",".join([
+                    r["date"], n(r["open"]), n(r["high"]), n(r["low"]),
+                    n(r["close"]), n(r["adj"]),
+                    str(int(r["volume"])) if r["volume"] else "0"]))
+        return "\n".join(lines) if len(lines) > 1 else None
+
+    def indicator_text(self, indicator, as_of_date, look_back_days):
+        """One technical indicator over a lookback window, computed by
+        stockstats (the same engine TradingAgents' vendor uses) on the
+        fleet's adjusted series — so the market analyst's SMA/RSI/MACD
+        values stop coming from the broken vendor series."""
+        if self._ohlc_rows is None:
+            self._ohlc_rows = fetch_ohlc(self.ticker, self.as_of) or []
+        if not self._ohlc_rows:
+            return None
+        try:
+            import pandas as pd
+            from stockstats import StockDataFrame
+            rows = [r for r in self._ohlc_rows if r["date"] <= as_of_date]
+            if len(rows) < 30:
+                return None
+            df = pd.DataFrame({
+                "date": [r["date"] for r in rows],
+                "open": [r["open"] for r in rows],
+                "high": [r["high"] for r in rows],
+                "low": [r["low"] for r in rows],
+                "close": [r["close"] for r in rows],
+                "volume": [r["volume"] or 0 for r in rows],
+            })
+            sdf = StockDataFrame.retype(df.set_index("date"))
+            series = sdf[indicator]
+            tail = [(d, v) for d, v in zip(df["date"], series)
+                    if v == v]  # drop NaN warm-up rows
+            if not tail:
+                return None
+            tail = tail[-max(1, int(look_back_days)):]
+            lines = [f"{indicator} for {self.ticker} up to {as_of_date} "
+                     f"(fleet-adjusted price series):"]
+            lines += [f"{d}: {v:.4f}" for d, v in tail]
+            return "\n".join(lines)
+        except Exception:
+            return None
 
     def items(self):
         if self._items is None:
