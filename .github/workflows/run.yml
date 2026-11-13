@@ -14,10 +14,17 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: pip
 
       - name: Install dependencies
         run: |
-          git clone --depth 1 https://github.com/AI4Finance-Foundation/FinRobot.git finrobot_src
+          # PINNED upstream commit (2026-11-13; the code the fleet's
+          # proven runs used) — an unpinned clone lets upstream drift
+          # change behaviour silently between sweeps.
+          git init finrobot_src
+          git -C finrobot_src remote add origin https://github.com/AI4Finance-Foundation/FinRobot.git
+          git -C finrobot_src fetch --depth 1 origin 63e1884a42ea7b729551a5424b4bd6a65af636e0
+          git -C finrobot_src checkout FETCH_HEAD
           pip install -e ./finrobot_src
           pip install openai
 
