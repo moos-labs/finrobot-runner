@@ -101,6 +101,32 @@ def main() -> int:
     from datetime import date, timedelta
     today = date.today()
     start = today - timedelta(days=100)
+    # Fleet context injection (root fix): yfinance carries no EGX news
+    # and thin coverage elsewhere, so the agent previously reasoned
+    # about news it could not see. The fleet's own verified headlines +
+    # official disclosures are fetched live and put in the prompt; the
+    # context is also saved to results/ for the sweep archive.
+    context_block = ""
+    try:
+        import fleet_context
+        ctx = fleet_context.FleetContext(ticker, today.isoformat())
+        ctx.save(str(results))
+        news_txt = ctx.news_text(max_chars=6000)
+        if news_txt:
+            context_block = (
+                "\n\nFLEET-VERIFIED NEWS & DISCLOSURES (fetched live by "
+                "the Borsagator fleet — treat this as the authoritative "
+                "news record for this ticker; your price tools carry no "
+                "news for many markets):\n" + news_txt)
+        fund_txt = ctx.fundamentals_text()
+        if fund_txt:
+            context_block += ("\n\nFLEET-VERIFIED FUNDAMENTALS:\n"
+                              + fund_txt[:3000])
+        print(f"Fleet context: {len(ctx.items())} items, "
+              f"fundamentals={'yes' if fund_txt else 'no'}")
+    except Exception as e:
+        print(f"Fleet context unavailable ({type(e).__name__}: {e}); "
+              f"continuing without it")
     prompt = (
         f"Today is {today.isoformat()}. Analyze the stock {ticker}. "
         f"First use your tools to fetch its daily price data for the most "
@@ -110,6 +136,7 @@ def main() -> int:
         f"and end with a line exactly like "
         f"'VERDICT: bullish - one sentence reason' (or bearish / neutral). "
         f"Reply TERMINATE at the very end."
+        + context_block
     )
     agent.chat(prompt)
 
