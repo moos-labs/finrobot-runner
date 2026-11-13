@@ -98,6 +98,45 @@ def main() -> int:
     # chat_messages before we can harvest the transcript -- disable the
     # reset for this one-shot run.
     agent.reset = lambda: None
+    # History sanitizer (root fix): Cohere's compatibility endpoint
+    # rejects the WHOLE request when any history message has empty
+    # content and no tool calls (400: "invalid message provided at
+    # index N: must have non-empty content or tool calls"). AG2
+    # histories accumulate exactly those — an assistant turn that only
+    # emitted tool calls in a wrapper, a tool result that came back
+    # empty — and one such message kills the run mid-conversation
+    # (first seen 2026-11-13, full sweep #20). Sanitize a copy of the
+    # history before every LLM call: any message with neither content
+    # nor tool calls gets a placeholder; nothing is dropped, so
+    # tool_call/result pairing is preserved.
+    try:
+        from autogen.agentchat.contrib.capabilities.transform_messages \
+            import TransformMessages
+
+        class _NonEmptyHistory:
+            def apply_transform(self, messages):
+                out = []
+                for m in messages:
+                    content = m.get("content")
+                    if (content is None
+                            or (isinstance(content, str)
+                                and not content.strip())) \
+                            and not m.get("tool_calls"):
+                        m = dict(m)
+                        m["content"] = "(no output)" \
+                            if m.get("role") == "tool" else "(empty)"
+                    out.append(m)
+                return out
+
+            def get_logs(self, pre_messages, post_messages, **kwargs):
+                return ("sanitized empty-content history messages", "")
+
+        TransformMessages(transforms=[_NonEmptyHistory()]) \
+            .add_to_agent(agent.assistant)
+        print("History sanitizer attached (TransformMessages)")
+    except Exception as e:
+        print(f"History sanitizer unavailable ({type(e).__name__}: {e}); "
+              f"continuing without it")
     from datetime import date, timedelta
     today = date.today()
     start = today - timedelta(days=100)
